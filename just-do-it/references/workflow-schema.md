@@ -3,106 +3,84 @@
 ## Complete Schema
 
 ```yaml
-name: workflow-name
-description: Brief description of the workflow
+name: workflow-name                # Required: Workflow identifier
 
 steps:
-  - name: step-name           # Required: Unique step identifier
-    agent: agent-type         # Optional: Sub-agent type (must be valid subagent_type)
-                              #   If omitted, prompt runs directly on the orchestrator
-    prompt: |                 # Required: Instructions for sub-agent (or orchestrator if no agent)
+  step-name:                       # Key is the unique step identifier
+    agent: agent-type              # Optional: Sub-agent type (default: general-purpose)
+    prompt: |                      # Required: Instructions for sub-agent
       Multi-line prompt...
-    report:                   # Optional: Output report configuration
-      name: report-name       # Required if report: Filename without extension
-      format: |               # Required if report: Markdown template (advisory)
-        ## Report Template
-        ...
-      validation: "REGEX"     # Optional: Regex pattern to validate output
-    human: true               # Optional: Requires --human flag to execute
-    next: next-step           # Optional: Default next step name
-    end: true                 # Optional: If true, completes workflow
-    conditions:               # Optional: Conditional transitions
-      - keyword: KEYWORD      # Required: Keyword to match
-        goto: target-step     # Required: Step name to transition to
+    human: true                    # Optional: Requires --human flag to execute
+    next:                          # Required: Routing array (evaluated top-to-bottom)
+      - if: KEYWORD                # Optional: Match against <!-- DECISION: KEYWORD -->
+        goto: target-step          # Required: Step name or "end"
+      - goto: fallback-step        # Last entry without `if` is the default/fallback
 ```
 
 ## Parallel Steps Schema
 
 ```yaml
-- name: parallel-step
-  parallel:                   # Use parallel instead of agent/prompt
-    - agent: agent-type-1
-      prompt: |
-        Instructions for first agent...
-    - agent: agent-type-2
-      prompt: |
-        Instructions for second agent...
-  check: all                  # "all" = all must pass, "any" = first pass wins
-  human: true                 # Optional: Gates entire parallel execution
-  report:
-    name: report-name
-    format: |
-      ## Parallel Results
-      ...
-    validation: "APPROVED|REJECTED"
-  conditions:
-    - keyword: APPROVED
-      goto: next-step
-    - keyword: REJECTED
-      goto: retry-step
+  parallel-step:
+    parallel:                      # Use parallel instead of agent/prompt
+      - agent: agent-type-1        # Required: Each parallel agent must specify type
+        prompt: |
+          Instructions for first agent...
+      - agent: agent-type-2
+        prompt: |
+          Instructions for second agent...
+    check: all                     # "all" = all must match, "any" = first match wins
+    human: true                    # Optional: Gates entire parallel execution
+    next:
+      - if: APPROVED
+        goto: next-step
+      - if: REJECTED
+        goto: retry-step
+      - goto: retry-step           # Fallback
 ```
 
 ## Step Fields Reference
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Unique step identifier |
-| `agent` | string | No | Sub-agent type. If omitted (and not parallel), prompt runs directly on the orchestrator |
-| `prompt` | string | Yes* | Instructions for sub-agent or orchestrator (*not for parallel) |
-| `parallel` | array | No | Array of {agent, prompt} for parallel execution |
-| `check` | string | No | "all" or "any" for parallel steps |
-| `report` | object | No | Output report configuration |
-| `report.name` | string | Yes if report | Report filename (without extension) |
-| `report.format` | string | Yes if report | Markdown template (guidance only) |
-| `report.validation` | string | No | Regex pattern to validate output |
-| `next` | string | No | Default next step name |
-| `end` | boolean | No | If true, this step completes workflow |
-| `conditions` | array | No | Conditional transitions |
-| `conditions[].keyword` | string | Yes | Keyword to match |
-| `conditions[].goto` | string | Yes | Step name to transition to |
-| `human` | boolean | No | When true, step requires `--human` flag. Defaults to false. On parallel steps: gates entire parallel execution. NOT allowed on individual agents within parallel block. |
+| (key) | string | Yes | Unique step identifier (the YAML map key) |
+| `agent` | string | No | Sub-agent type. Defaults to `general-purpose` if omitted |
+| `prompt` | string | Yes* | Instructions for sub-agent (*not used for parallel steps) |
+| `parallel` | array | No | Array of `{agent, prompt}` for parallel execution |
+| `check` | string | No | `"all"` or `"any"` for parallel decision aggregation |
+| `human` | boolean | No | When true, step requires `--human` flag. On parallel steps: gates entire execution. NOT allowed on individual agents within parallel block |
+| `next` | array | Yes | Routing array. Evaluated top-to-bottom. First `if` match wins. Last entry without `if` is the default fallback. Missing `next` is a schema validation error |
+| `next[].if` | string | No | Decision keyword to match against `<!-- DECISION: KEYWORD -->` |
+| `next[].goto` | string | Yes | Target step name, or `"end"` to terminate workflow |
 
-## Inline Execution (No Agent)
+## Decision Block Convention
 
-When `agent` is omitted from a step, the orchestrator executes the prompt directly instead of delegating to a sub-agent via the Task tool. This is useful for lightweight steps that don't need a separate agent context, such as file transformations, simple validations, or aggregation of prior reports.
+Agents communicate routing decisions by including a structured comment at the end of their output:
 
-```yaml
-- name: summarize
-  prompt: |
-    Read the reports from prior steps and produce a summary...
-  report:
-    name: summary
-    format: |
-      ## Summary
-      ...
-    validation: "SUMMARY_COMPLETE"
-  end: true
+```
+<!-- DECISION: KEYWORD -->
 ```
 
-All other step features (reports, validation, conditions, human gates, next/end) work identically for inline steps.
+### Rules
 
-## Reserved Keywords
+- The orchestrator extracts the keyword from the **last 5 lines** of agent output
+- Extraction uses: `echo "$output" | tail -5 | grep -oP '<!-- DECISION: \K\w+' | tail -1`
+- The keyword is matched against the step's `next` array
+- **Terminal steps** (`next: [- goto: end]` with no `if` entries) skip decision parsing entirely — no `<!-- DECISION -->` needed
+- **Missing keyword**: If no keyword found and the step has conditional routing, the fallback route is taken and a lesson is recorded
 
-| Keyword | Purpose |
-|---------|---------|
-| `TASK_DONE` | Short-circuit to completion when task needs no work |
+### Parallel Decision Aggregation
+
+- Each parallel agent includes `<!-- DECISION: KEYWORD -->` in its output
+- `check: all` — All agents must produce the same keyword for it to match. If agents disagree, the default/fallback route is taken
+- `check: any` — The `next` array is walked top-to-bottom; for each `if` entry, if ANY agent produced that keyword, the route is taken
 
 ## Important Rules
 
-1. **Entry point**: First step in YAML is the entry point
-2. **No `goto: end`**: Use `end: true` on final step instead
-3. **Conditions use `goto`**: `end: true` is only valid at step level
-4. **Parallel reports**: Written as `{step_name}_{index}.md`
-5. **`check: all`**: Any failure/rejection keyword wins over approvals
-6. **Parallel agents require `agent`**: Each entry in a `parallel` block must specify `agent`. Inline execution (omitting `agent`) is only supported for non-parallel steps
-7. **Completion semantics of `end: true`**: `end: true` on a step means the workflow is complete ONLY when that step finishes without a condition redirecting elsewhere. A step can have both `end: true` and `conditions` — if a condition matches, the condition's `goto` takes priority and the workflow continues. The `end: true` flag is only honored when no condition matches.
+1. **Entry point**: First step in the YAML map is the entry point
+2. **`next` is required**: Every step must have a `next` array. Missing `next` is a schema validation error — fail fast
+3. **Completion**: Only `goto: end` completes a workflow. There is no other completion mechanism
+4. **Routing order**: The `next` array is evaluated top-to-bottom. First `if` match wins. The last entry without `if` is the default/fallback
+5. **Parallel agents require `agent`**: Each entry in a `parallel` block must specify `agent`
+6. **Reports**: Always written to `.jdi/reports/{task_id}/{step_name}.md`. Parallel outputs are merged into a single file
+7. **`check: all`**: If parallel agents disagree on the keyword, the fallback route wins
+8. **Human gate on parallel**: `human: true` gates the entire parallel block. NOT allowed on individual agents within the block
