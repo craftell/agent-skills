@@ -4,9 +4,47 @@ description: Workflow orchestration for AI agents. Runs workflows that delegate 
 argument-hint: <command> [options]
 disable-model-invocation: true
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Task, Skill
+# NOTE: TaskCreate, TaskUpdate, TaskList, TaskGet are intentionally EXCLUDED.
+# All task operations go through the task-management skill via the Skill tool.
 ---
 
 # just-do-it Workflow Orchestrator
+
+## CRITICAL RULE — Task Operations Must Use the Skill Tool
+
+**NEVER call built-in `TaskCreate`, `TaskUpdate`, `TaskList`, or `TaskGet` tools directly.** Every task operation MUST go through the `task-management` skill (or the skill name configured in `task_skill`) using the **Skill tool**.
+
+### Correct (Skill tool)
+
+```
+Skill: task-management, args: "next"
+Skill: task-management, args: "context"
+Skill: task-management, args: "complete"
+Skill: task-management, args: "update --step \"review\""
+Skill: task-management, args: "update --feedback \"needs error handling\""
+```
+
+### WRONG (built-in tools) — NEVER DO THIS
+
+```
+TaskList          ← FORBIDDEN
+TaskGet           ← FORBIDDEN
+TaskUpdate        ← FORBIDDEN
+TaskCreate        ← FORBIDDEN
+```
+
+### Why
+
+The `task-management` skill is an abstraction layer. Users may back it with GitHub Issues, Linear, or another system — not just Claude's built-in task tools. Bypassing it:
+- Breaks when the backend is not Claude's built-in task tools
+- Skips the skill's step-prefix parsing, status transitions, and output formatting
+- Produces output the orchestrator cannot parse
+
+### Self-Check (apply before EVERY task operation)
+
+> "Am I about to call a built-in `TaskXxx` tool?" → **STOP.** Use `Skill: task-management` instead.
+
+---
 
 ## CRITICAL RULE — Task Completion
 
@@ -14,19 +52,16 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Task, Skill
 
 ### Mandatory Checklist — Before calling `/task-management complete`
 
-You MUST answer all three questions YES. If ANY answer is NO → write `CONTINUE`, do NOT complete.
+You MUST answer this question YES. If NO → write `CONTINUE`, do NOT complete.
 
-1. Did the guard script in step 11 return `COMPLETE`? (Not CONTINUE, not ABORT)
-2. Is the current step's `end` field set to `true` in the workflow YAML, OR did `TASK_DONE` appear in the matched keywords?
-3. Did NO condition in the current step redirect to another step?
+1. Did step 11 (routing evaluation) resolve to `goto: end`?
+
+That is the **ONLY** completion signal. No other step output, keyword, or agent message means the workflow is complete.
 
 ### Common Mistakes to Avoid
 
-- **The sub-agent says "Done! Task complete."** → This does NOT mean the workflow is complete. The agent is reporting its step output. Only the workflow structure (`end: true` / `TASK_DONE`) determines completion.
-- **You finished executing step "implement" and it succeeded** → The workflow has more steps (review, finalize). Write `CONTINUE`.
-- **You are executing inline (no agent) and finished the work** → You finished the STEP, not the workflow. Check the workflow structure.
-
-When executing inline (no `agent`), be especially careful: the orchestrator must NOT use its own task management tools (TaskUpdate, TaskCreate, etc.) to alter task status outside of the workflow's explicit completion path in step 15.
+- **The sub-agent says "Done! Task complete."** → This does NOT mean the workflow is complete. The agent is reporting its step output. Only `goto: end` in the routing determines completion.
+- **You finished executing a step and it succeeded** → The workflow likely has more steps (review, finalize). Write `CONTINUE`.
 
 ## CRITICAL RULE — Lock Cleanup
 
@@ -86,14 +121,15 @@ Execute one workflow step, then exit. Caller handles looping.
    - If `--workflow` specified: try as file path, then lookup in `.jdi/workflows/`
    - Otherwise: use `default_workflow` from config (default: `default.yaml`)
    - Parse YAML, validate structure (see references/workflow-schema.md)
+   - Validate that every step has a `next` array. Missing `next` is a schema error — fail fast with a clear message.
 
 3. **Get current task**
    - If `--task ID` specified: use that task
-   - Otherwise: invoke `/task-management next`
+   - Otherwise: invoke `/task-management next` **(⚠ use Skill tool, NOT built-in TaskList/TaskGet)**
    - If `NO_TASKS_AVAILABLE` or task already complete: write `WORKFLOW_COMPLETE` to status, exit
 
 4. **Get task context**
-   - Invoke `/task-management context`
+   - Invoke `/task-management context` **(⚠ use Skill tool, NOT built-in TaskGet)**
    - Parse current step from subject prefix (e.g., `[review]` → step is `review`)
    - If no prefix or prefix doesn't match a step name: use first step
 
@@ -127,80 +163,69 @@ Execute one workflow step, then exit. Caller handles looping.
 8. **Execute step**
    - Find step definition in workflow
    - Build prompt: task context + step prompt
-   - Append to every agent/inline prompt: `Include a "## Summary" section (2-4 sentences) at the end of your response summarizing what you did and the outcome.`
+   - Determine agent type: use step's `agent` field, or `general-purpose` if not specified
    - If parallel step: use Task tool for each agent (run concurrently)
-   - Else if `agent` is specified: use Task tool with step's agent type
-   - Else (no `agent`): execute the prompt directly in the orchestrator context — do NOT use the Task tool. The orchestrator itself processes the prompt using its own tools and capabilities. Capture the result as the step output. **CRITICAL**: During inline execution, do NOT call `/task-management complete` or otherwise alter task status — task lifecycle is handled exclusively in step 15. **REMINDER**: Executing a step's prompt inline means YOU are doing the step's work. When you finish, you have completed THE STEP — not the workflow. Proceed to step 9 (validation) next. Do NOT call `/task-management complete` here.
+   - Else: use Task tool with the determined agent type
    - Capture output
 
-9. **Validate output**
-   - Write output to temp file
-   - Run `scripts/validate_output.py <pattern> <temp_file>`
-   - If validation fails (exit code 1): write ABORT status, log error entry, **then proceed to step 16** (release lock)
-   - Capture matched keywords from stdout
+9. **Parse decision**
+   - If the step's `next` array contains only unconditional entries (no `if` fields): skip decision parsing entirely. Use the first route directly.
+   - Otherwise: extract decision keyword from the last 5 lines of agent output using bash:
+     ```bash
+     echo "$output" | tail -5 | grep -oP '<!-- DECISION: \K\w+' | tail -1
+     ```
+   - If keyword found: store for routing in step 11
+   - If keyword NOT found:
+     - Use the default/fallback route (the `next` entry without `if`)
+     - Record a lesson in `.jdi/LESSONS.md` with trigger `MISSING_DECISION`
+   - For **parallel steps**: extract decisions from each agent's output separately (see Parallel Step Handling)
 
 10. **Write report**
-   - Create `.jdi/reports/{task_id}/` directory if needed
-   - **Append** output with a timestamp heading to preserve history across loops (e.g., review → revise → review):
-     - **First run** (file does not exist): use `Write` tool to create the file
-     - **Subsequent runs** (file already exists): use `Bash` with heredoc `>>` to append (preserves inode for `tail -f`)
-   - Each entry uses this format:
-     ```markdown
-     ## YYYY-MM-DD HH:MM:SS
+    - Create `.jdi/reports/{task_id}/` directory if needed
+    - Use the `Write` tool to **overwrite** the report file with the latest output
+    - Target file: `.jdi/reports/{task_id}/{step_name}.md`
+    - For parallel steps: merge all outputs into a single `{step_name}.md` (see Parallel Step Handling for format)
 
-     {agent output}
-
-     ---
-     ```
-   - Target file: `{step_name}.md` (or `{step_name}_{index}.md` for parallel)
-
-11. **Evaluate conditions**
-    - **Re-read the workflow file** and find the current step definition. Check its `end` field and `conditions` array. Do NOT rely on memory or inference — read the actual YAML.
-    - Check matched keywords against step's conditions
-    - If multiple keywords match different conditions: write ABORT status, log error entry, **then proceed to step 16** (release lock)
-    - If `TASK_DONE` in keywords: skip to completion
-    - Determine next step via conditions or `next` field
-    - If `end: true` and no condition matches: workflow complete
-    - **Completion vs continuation decision table:**
-
-      | Current step has `end: true`? | Condition redirects to another step? | `TASK_DONE` in keywords? | Decision |
-      |---|---|---|---|
-      | Yes | No | — | COMPLETE |
-      | Yes | Yes | — | CONTINUE (condition wins) |
-      | No | — | Yes | COMPLETE |
-      | No | — | No | CONTINUE |
+11. **Evaluate routing**
+    - **Re-read the workflow file** and find the current step's `next` array. Do NOT rely on memory or inference — read the actual YAML.
+    - Walk the `next` array top-to-bottom:
+      1. If entry has `if` field: compare against extracted decision keyword. If match → use this route.
+      2. If entry has no `if` field: this is the default/fallback. Use it.
+    - If `goto: end`: workflow is complete for this task
+    - If `goto: {step_name}`: workflow continues to that step
+    - If no route matched (malformed `next` array — no fallback and no keyword match): write ABORT, log error, **then proceed to step 16** (release lock)
+    - If `goto` target references a step that doesn't exist in the workflow: write ABORT, log error, **then proceed to step 16** (release lock)
 
 12. **Update task**
-    - If transitioning to different step: invoke `/task-management update --step "new-step"`
-    - If rejected or error with feedback: invoke `/task-management update --feedback "..."`
+    - If transitioning to a different step: invoke `/task-management update --step "new-step"` **(⚠ Skill tool)**
+    - If rejected or error with feedback: invoke `/task-management update --feedback "..."` **(⚠ Skill tool)**
 
-13. **Record lessons** (REJECTED only)
+13. **Record lessons** (REJECTED or MISSING_DECISION only)
     - Append to `.jdi/LESSONS.md`:
     ```markdown
     ## {date} - Task #{id}, Step: {step_name}
 
-    **Trigger:** REJECTED
+    **Trigger:** {REJECTED | MISSING_DECISION}
 
-    **Lesson:** {rejection reason from output}
+    **Lesson:** {description of what happened and why}
     ```
-    - Note: `HUMAN_REQUIRED` is expected control flow, not a failure. No lesson is recorded.
+    - **REJECTED**: Record the rejection reason extracted from agent output
+    - **MISSING_DECISION**: Record that the agent did not include `<!-- DECISION: KEYWORD -->` and the fallback route was taken
+    - Other failure modes (ABORT, crashes, lock contention) are NOT recorded as lessons — they are operational issues, not learnable workflow insights
 
 14. **Append to orchestrator log**
     - Target file: `.jdi/reports/{task_id}/orchestrator.md` (already created in step 5)
     - Use `Bash` with a heredoc and `>>` to append. This preserves the file's inode so `tail -f` continues to work. Example: `cat >> .jdi/reports/{task_id}/orchestrator.md << 'ENTRY'\n{content}\nENTRY`
     - For error/abort scenarios, use the **error entry** format instead
-    - Extract the `## Summary` section from the agent output for the entry's summary block. If the agent did not include one, write `> (no summary provided)` instead.
-    - Include the **full agent output** in a collapsible `<details>` block after the summary blockquote (see Step Entry format below). This preserves complete context for debugging without cluttering the `tail -f` view.
+    - Include the **full agent output** in a collapsible `<details>` block (see Orchestrator Log Format below)
 
 15. **Determine status and write**
-    - **CRITICAL**: Only treat the workflow as "complete" when step 11 determined completion
-      (i.e., `end: true` with no matching condition, or `TASK_DONE` keyword matched).
+    - **CRITICAL**: Only treat the workflow as "complete" when step 11 resolved to `goto: end`.
       Do NOT infer completion from any other signal. When in doubt, write `CONTINUE`.
-    - If workflow complete (and ONLY then):
-      - Before invoking `/task-management complete`, print: `✓ Completing: step={step_name} end={true/false} keywords={matched} reason={end:true with no redirect / TASK_DONE}`
-      - Invoke `/task-management complete`
+    - If workflow complete (`goto: end`):
+      - Print: `✓ Completing: step={step_name} goto=end`
+      - Invoke `/task-management complete` **(⚠ use Skill tool, NOT built-in TaskUpdate)**
       - Append the **completion entry** to the orchestrator log using `Bash` with heredoc `>>` (same inode-preserving pattern as step 14)
-      - Write summary to `.jdi/reports/{task_id}/summary.md`
       - Write `STEP_COMPLETE step={step_name}` — this signals that one task's workflow finished. The caller (bash loop) decides whether to continue to the next task or stop.
     - If error/abort: write `ABORT` (the error entry was already written in step 14)
     - If more steps remain: write `CONTINUE` — do NOT invoke `/task-management complete`
@@ -216,11 +241,25 @@ Execute one workflow step, then exit. Caller handles looping.
 For steps with `parallel` key:
 1. Launch all agents concurrently via Task tool
 2. Collect all outputs
-3. Validate each output
-4. Determine combined result:
-   - `check: all`: Any failure/rejection keyword wins
-   - `check: any`: First pass keyword wins
-5. Write separate reports: `{step_name}_0.md`, `{step_name}_1.md`, etc.
+3. Extract `<!-- DECISION: KEYWORD -->` from each agent's output
+4. Determine combined decision:
+   - `check: all`: All agents must produce the same keyword for it to match an `if` entry. If agents disagree, take the default/fallback route.
+   - `check: any`: Walk the `next` array top-to-bottom. For each `if` entry, if ANY agent produced that keyword, use that route.
+5. Merge all outputs into a single `{step_name}.md` report:
+   ```markdown
+   ## Agent 0: {agent_type}
+
+   {full output from agent 0}
+
+   ---
+
+   ## Agent 1: {agent_type}
+
+   {full output from agent 1}
+
+   ---
+   ```
+6. Log per-agent decisions in the orchestrator log for observability
 
 ### Error Handling
 
@@ -229,9 +268,9 @@ For steps with `parallel` key:
 | Scenario | Action |
 |----------|--------|
 | No output from sub-agent | Write ABORT, log error, **release lock (step 16)** |
-| Validation fails | Write ABORT, log error, **release lock (step 16)** |
-| Multiple ambiguous keyword matches | Write ABORT, log error, **release lock (step 16)** |
-| Invalid goto target | Write ABORT, log error, **release lock (step 16)** |
+| Missing decision keyword (step has conditionals) | Use fallback route, record lesson (MISSING_DECISION), continue normally |
+| No fallback route in `next` array | Write ABORT, log error, **release lock (step 16)** |
+| Invalid `goto` target (step doesn't exist) | Write ABORT, log error, **release lock (step 16)** |
 | Lock file exists (≤10 min old) | Fail immediately with lock error (no lock acquired) |
 | Lock file exists (>10 min old) | Remove stale lock, print warning, proceed normally |
 | Workflow file not found | Fail with instructions (no lock acquired) |
@@ -265,12 +304,10 @@ The orchestrator log (`.jdi/reports/{task_id}/orchestrator.md`) is a human-reada
 
 | | |
 |---|---|
-| **Agent** | {agent type, or "inline"} |
+| **Agent** | {agent type} |
 | **Duration** | {N.N}s |
-| **Keywords** | {matched keywords, e.g. APPROVED} |
-| **Transition** | {step_name} → {next_step} (condition: {keyword}) |
-
-> {Summary extracted from agent's ## Summary section}
+| **Decision** | {extracted keyword, or "(none)"} |
+| **Transition** | {step_name} → {next_step} |
 
 <details>
 <summary>Full output</summary>
@@ -284,25 +321,23 @@ The orchestrator log (`.jdi/reports/{task_id}/orchestrator.md`) is a human-reada
 
 - The heading uses `→` to show the transition. For the first step (no previous), use: `## [{HH:MM:SS}] → {step_name}` (start).
 - For end steps with no next step: `## [{HH:MM:SS}] {step_name} → DONE`.
-- The `Transition` row shows the condition that triggered the transition. If no condition (default `next`), write `(default)`. If end step, write `(end)`.
-- For parallel steps, list each agent on its own row in the table and include each agent's summary as a separate blockquote, prefixed with the agent type. Each agent gets its own `<details>` block:
+- The `Transition` row shows the routing result. If default/fallback route, write `(fallback)`. If end, write `(end)`.
+- For parallel steps, list each agent on its own row in the table and include each agent's output in a separate `<details>` block:
 
 ```markdown
-> **{agent-type-1}:** {summary}
+| **Decision** | Agent 0: {keyword}, Agent 1: {keyword} |
 
 <details>
-<summary>Full output ({agent-type-1})</summary>
+<summary>Full output (Agent 0: {agent-type})</summary>
 
-{agent-type-1 full output}
+{agent 0 full output}
 
 </details>
 
-> **{agent-type-2}:** {summary}
-
 <details>
-<summary>Full output ({agent-type-2})</summary>
+<summary>Full output (Agent 1: {agent-type})</summary>
 
-{agent-type-2 full output}
+{agent 1 full output}
 
 </details>
 ```
@@ -313,8 +348,6 @@ The orchestrator log (`.jdi/reports/{task_id}/orchestrator.md`) is a human-reada
 ## [{HH:MM:SS}] ⚠ ABORT — {step_name}
 
 **Error:** {description of what went wrong}
-
-> {Any available context or agent output summary}
 
 <details>
 <summary>Agent output (if any)</summary>
@@ -371,7 +404,7 @@ Interactive setup for new projects.
 Display current workflow state.
 
 1. Read `.jdi/status` file
-2. Invoke `/task-management context`
+2. Invoke `/task-management context` **(⚠ use Skill tool, NOT built-in TaskGet)**
 3. Read workflow file from config
 4. Output:
    ```
@@ -440,8 +473,7 @@ Auto-create directories as needed:
 │   └── default.yaml
 ├── reports/{task_id}/
 │   ├── orchestrator.md      # Human-readable workflow log (tail this!)
-│   ├── {step_name}.md
-│   └── summary.md
+│   └── {step_name}.md
 ├── locks/{task_id}.lock
 ├── lessons_archive/
 └── LESSONS.md
@@ -449,10 +481,9 @@ Auto-create directories as needed:
 
 ## Resources
 
-- **scripts/validate_output.py**: Validates sub-agent output against regex patterns
 - **references/workflow-schema.md**: Complete workflow YAML schema reference
 - **assets/templates/jdi_template/**: Scaffolding template copied as `.jdi/` by `jdi init`
-- **assets/task-management.skill**: Template for task-management skill (user must copy)
+- **assets/sample-claude-code-task-management-skill.md**: Template for task-management skill (user must copy)
 - **assets/sample-workflow.yaml**: Complete example workflow (plan → implement → review → finalize)
 - **assets/just-do-it.sh**: Bash loop runner with configurable max iterations
 
@@ -480,9 +511,6 @@ cp /path/to/just-do-it/assets/just-do-it.sh ./
 
 # Stop after current task completes (don't continue to next)
 ./just-do-it.sh -s
-
-# Show verbose output
-./just-do-it.sh -v
 ```
 
 Exit codes: `0` = WORKFLOW_COMPLETE (or STEP_COMPLETE with `-s`), `1` = ABORT, `2` = max iterations reached, `3` = HUMAN_REQUIRED
