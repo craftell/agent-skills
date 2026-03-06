@@ -2,7 +2,7 @@
 config.local.yaml
 
 # Runtime artifacts
-locks/
 status
 reports/
-lessons_archive/
+tasks/
+archived/
