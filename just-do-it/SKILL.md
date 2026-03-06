@@ -74,11 +74,18 @@ Execute one workflow step, then exit. Caller handles looping.
 
 7. **Execute step**
    - Resolve file references (`prompt_file`, `format_file` — relative to `workflow_dir`). Both inline and file present → ABORT.
-   - Build prompt: task context (title, description, feedback) + step prompt
-   - Append: `Include a "## Summary" section (2-4 sentences) at the end summarizing what you did and the outcome.`
-   - If `report.format`: append `Write your report strictly following this template's structure AND language:\n\n{format}`
-   - Agent: step's `agent` field, default `general-purpose`
-   - Execute via Agent tool, capture output. No output → ABORT.
+   - **Standard step** (has `prompt`/`prompt_file`, no `parallel`):
+     - Build prompt: task context (title, description, feedback) + step prompt
+     - Append: `Include a "## Summary" section (2-4 sentences) at the end summarizing what you did and the outcome.`
+     - If `report.format`: append `Write your report strictly following this template's structure AND language:\n\n{format}`
+     - Agent: step's `agent` field, default `general-purpose`
+     - Execute via Agent tool, capture output. No output → ABORT.
+   - **Parallel step** (has `parallel` array):
+     - For each branch in `parallel`: resolve its `prompt`/`prompt_file`, build prompt with task context + branch prompt + summary/format instructions (same as standard step).
+     - Dispatch all branches concurrently via parallel Agent tool calls, each with its branch's agent (default `general-purpose`).
+     - Collect all outputs. Any branch returning no output → ABORT.
+     - Concatenate all branch outputs (separated by `\n\n---\n\n`) into a single combined output for subsequent steps (validation, report, conditions).
+     - `check` field determines pass/fail: `all` = every branch must pass.
 
 8. **Validate output** (only if `report.validation` exists)
    - Run `scripts/validate_output.py <pattern> <temp_file>` (script path relative to skill install directory)

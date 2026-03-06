@@ -1,7 +1,7 @@
-# Sample Workflow: Code Implementation with Review
-# This workflow demonstrates all available properties.
+# Sample Workflow: Code Implementation with Parallel Review
+# This workflow demonstrates all available properties including parallel execution.
 #
-# Flow: plan -> implement -> review -> finalize -> end
+# Flow: plan -> implement -> review (parallel: quality + security) -> finalize -> end
 #       └──────────────────┘ (loop on REJECTED)
 
 name: code-implementation
@@ -86,24 +86,36 @@ steps:
       - keyword: ERROR
         goto: implement               # Retry on error
 
-  # Step 3: Review phase
+  # Step 3: Review phase (parallel — multiple reviewers run concurrently)
   - name: review
-    agent: code-reviewer
-    prompt: |
-      Review the implementation in reports/implementation.md for:
-      - Code quality and readability
-      - Test coverage and correctness
-      - Performance considerations
-      - Error handling
-      - Security vulnerabilities (OWASP Top 10)
-      - Input validation
-      - Authentication/authorization issues
+    parallel:
+      - agent: code-reviewer
+        prompt: |
+          Review the implementation in reports/implementation.md for:
+          - Code quality and readability
+          - Test coverage and correctness
+          - Performance considerations
+          - Error handling
 
-      Reference the plan in reports/plan.md for context.
+          Reference the plan in reports/plan.md for context.
 
-      IMPORTANT: End your response with exactly one of:
-      - APPROVED if the code meets standards
-      - REJECTED with specific feedback if changes are needed
+          IMPORTANT: End your response with exactly one of:
+          - APPROVED if the code meets standards
+          - REJECTED with specific feedback if changes are needed
+      - agent: code-reviewer
+        prompt: |
+          Review the implementation in reports/implementation.md for:
+          - Security vulnerabilities (OWASP Top 10)
+          - Input validation
+          - Authentication/authorization issues
+          - Dependency safety
+
+          Reference the plan in reports/plan.md for context.
+
+          IMPORTANT: End your response with exactly one of:
+          - APPROVED if the code meets standards
+          - REJECTED with specific feedback if changes are needed
+    check: all                         # All branches must pass
     report:
       name: review
       format: |
@@ -111,9 +123,11 @@ steps:
 
         **Status:** APPROVED | REJECTED
 
-        ### Findings
+        ### Code Quality Findings
         - Finding 1
-        - Finding 2
+
+        ### Security Findings
+        - Finding 1
 
         ### Recommendations
         - Recommendation 1
@@ -168,3 +182,5 @@ steps:
 # - Reports: Written to .jdi/reports/{task_id}/{step_name}.md
 # - Conditions: Only goto is valid in conditions; end: true is step-level only
 # - Feedback: On REJECTED, feedback is appended to task description for next iteration
+# - Parallel: Use `parallel` array + `check: all` to run multiple agents concurrently
+#   (replaces agent/prompt for that step). All branch outputs are concatenated.

@@ -7,6 +7,7 @@ name: workflow-name
 description: Brief description of the workflow
 
 steps:
+  # --- Standard step (single agent) ---
   - name: step-name           # Required: Unique step identifier
     agent: agent-type         # Optional: Sub-agent type. Default: general-purpose
     prompt: |                 # Instructions for sub-agent
@@ -25,6 +26,26 @@ steps:
     conditions:               # Optional: Conditional transitions
       - keyword: KEYWORD      # Required: Keyword to match
         goto: target-step     # Required: Step name to transition to
+
+  # --- Parallel step (multiple agents) ---
+  - name: parallel-step-name  # Required: Unique step identifier
+    parallel:                 # Replaces agent/prompt/prompt_file for this step
+      - agent: agent-type     # Optional: Sub-agent type per branch. Default: general-purpose
+        prompt: |             # Instructions for this branch's agent
+          ...
+        prompt_file: path.md  # Alternative: load prompt from file
+      - agent: agent-type
+        prompt_file: path.md
+    check: all                # Required for parallel: aggregation strategy (see below)
+    report:                   # Optional: same as standard step
+      name: report-name
+      format: |
+        ...
+      validation: "REGEX"
+    next: next-step
+    conditions:               # Optional: same as standard step
+      - keyword: KEYWORD
+        goto: target-step
 ```
 
 ## Step Fields Reference
@@ -32,9 +53,14 @@ steps:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique step identifier |
-| `agent` | string | No | Sub-agent type. Default: `general-purpose` |
-| `prompt` | string | Yes* | Instructions for sub-agent (mutually exclusive with `prompt_file`) |
-| `prompt_file` | string | No | Path to prompt file, relative to workflow directory (mutually exclusive with `prompt`) |
+| `agent` | string | No | Sub-agent type. Default: `general-purpose` (standard steps only) |
+| `prompt` | string | Yes* | Instructions for sub-agent (mutually exclusive with `prompt_file`; standard steps only) |
+| `prompt_file` | string | No | Path to prompt file, relative to workflow directory (mutually exclusive with `prompt`; standard steps only) |
+| `parallel` | array | No | List of parallel branches (mutually exclusive with `agent`/`prompt`/`prompt_file`) |
+| `parallel[].agent` | string | No | Sub-agent type for this branch. Default: `general-purpose` |
+| `parallel[].prompt` | string | Yes* | Prompt for this branch (mutually exclusive with `prompt_file`) |
+| `parallel[].prompt_file` | string | No | Path to prompt file for this branch (mutually exclusive with `prompt`) |
+| `check` | string | Yes if parallel | Aggregation strategy: `all` = every branch must pass |
 | `report` | object | No | Output report configuration |
 | `report.name` | string | Yes if report | Report filename (without extension) |
 | `report.format` | string | Yes if report | Markdown template — structure and language are authoritative (mutually exclusive with `format_file`) |
@@ -77,6 +103,47 @@ steps:
         ## Review Result
         ...
       validation: "APPROVED|REJECTED"
+```
+
+## Parallel Steps
+
+A step can run multiple sub-agents concurrently by using `parallel` instead of `agent`/`prompt`/`prompt_file`. Each entry in the `parallel` array is an independent branch with its own agent and prompt.
+
+**Fields:**
+- `parallel`: Array of branches. Each branch has `agent` (optional, default `general-purpose`) and `prompt` or `prompt_file` (one required, mutually exclusive).
+- `check`: Aggregation strategy. Required when `parallel` is used.
+  - `all` — Every branch must produce a passing result. If any branch fails (e.g., outputs `REJECTED`), the step as a whole fails.
+
+**Execution:**
+1. All branches are dispatched concurrently via the Agent tool (parallel tool calls).
+2. Each branch receives the same task context (title, description, feedback) combined with its own prompt.
+3. All branch outputs are concatenated into a single combined output for the step.
+4. The combined output is validated against `report.validation` (if present) and used for condition matching as usual.
+
+**Mutual exclusivity:** A step must use either `parallel` or `agent`/`prompt`/`prompt_file`, never both. Specifying both is a validation error (ABORT).
+
+**Example:**
+```yaml
+- name: be-review
+  parallel:
+    - agent: general-purpose
+      prompt_file: assets/prompts/be-review-event-modeling.prompt.md
+    - agent: general-purpose
+      prompt_file: assets/prompts/be-review-emmett.prompt.md
+  check: all
+  report:
+    name: be-review
+    format: |
+      ## Backend Review Result
+      **Status:** APPROVED | REJECTED
+      ...
+    validation: "APPROVED|REJECTED"
+  next: fe-implementation
+  conditions:
+    - keyword: APPROVED
+      goto: fe-implementation
+    - keyword: REJECTED
+      goto: be-implementation
 ```
 
 ## Important Rules
