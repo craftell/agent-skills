@@ -10,10 +10,11 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Agent
 
 ## Core Rules
 
-1. **Task completion is controlled exclusively by the Finalize phase.** Never set `status: completed` anywhere else. Premature completion corrupts the task queue.
-2. **Always delegate to sub-agents via Agent tool.** Default agent: `general-purpose`. The orchestrator never performs task work itself.
-3. **Archive completed tasks.** Move from `.jdi/tasks/` to `.jdi/archived/`.
-4. **Write status to `.jdi/status`.** Every exit path must write one of: `CONTINUE`, `STEP_COMPLETE step={name}`, `WORKFLOW_COMPLETE`, `ABORT`, `HUMAN_REQUIRED`.
+1. **ONE STEP PER INVOCATION — NEVER LOOP.** Each `/jdi run` executes exactly ONE workflow step, writes status, and STOPS. Do NOT proceed to the next step. Do NOT execute multiple steps. The caller (user or external loop) is responsible for invoking `/jdi run` again. This is the fundamental design contract — violating it defeats the entire purpose of the orchestrator (context isolation, human oversight, resumability). After writing `.jdi/status` in step 11, you are DONE. Return immediately.
+2. **Task completion is controlled exclusively by the Finalize phase.** Never set `status: completed` anywhere else. Premature completion corrupts the task queue.
+3. **Always delegate to sub-agents via Agent tool.** Default agent: `general-purpose`. The orchestrator never performs task work itself.
+4. **Archive completed tasks.** Move from `.jdi/tasks/` to `.jdi/archived/`.
+5. **Write status to `.jdi/status`.** Every exit path must write one of: `CONTINUE`, `STEP_COMPLETE step={name}`, `WORKFLOW_COMPLETE`, `ABORT`, `HUMAN_REQUIRED`.
 
 ## Task File Format
 
@@ -41,7 +42,7 @@ Parse `$ARGUMENTS` — `$0` is the subcommand. Empty/unrecognized → show usage
 
 ## run Command
 
-Execute one workflow step, then exit. Caller handles looping.
+Execute exactly ONE workflow step, then exit. NEVER execute a second step. Caller handles looping. After writing `.jdi/status`, STOP and return control to the caller immediately.
 
 ### Execution Flow
 
