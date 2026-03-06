@@ -144,7 +144,19 @@ main() {
     local start_time
     start_time=$(date +%s)
 
-    trap 'echo ""; log_warn "Interrupted (Ctrl+C)"; exit 130' INT TERM
+    local CLAUDE_PID=""
+    cleanup() {
+        echo ""
+        log_warn "Interrupted (Ctrl+C)"
+        if [[ -n "$CLAUDE_PID" ]]; then
+            # Kill the entire process group (negative PID)
+            kill -TERM -"$CLAUDE_PID" 2>/dev/null || true
+            sleep 0.5
+            kill -KILL -"$CLAUDE_PID" 2>/dev/null || true
+        fi
+        exit 130
+    }
+    trap cleanup INT TERM
 
     while true; do
         iteration=$((iteration + 1))
@@ -166,23 +178,20 @@ main() {
         local iter_start claude_exit=0
         iter_start=$(date +%s)
 
+        # Run claude in its own process group (setsid) so we can kill the
+        # whole tree on Ctrl+C.  `wait` is interruptible, so our trap fires.
         if $VERBOSE; then
-            claude -p "$cmd" || claude_exit=$?
+            setsid claude -p "$cmd" &
         else
-            claude -p "$cmd" 2>&1 | tail -20 || true
-            claude_exit=${PIPESTATUS[0]}
+            setsid bash -c 'claude -p "$1" 2>&1 | tail -20' _ "$cmd" &
         fi
+        CLAUDE_PID=$!
+        wait "$CLAUDE_PID" || claude_exit=$?
+        CLAUDE_PID=""
 
         local iter_end
         iter_end=$(date +%s)
         local iter_duration=$((iter_end - iter_start))
-
-        # Exit immediately if interrupted by signal (Ctrl+C = 130, SIGTERM = 143)
-        if [[ $claude_exit -eq 130 ]] || [[ $claude_exit -eq 143 ]]; then
-            echo ""
-            log_warn "Interrupted (Ctrl+C)"
-            exit 130
-        fi
 
         if [[ $claude_exit -ne 0 ]]; then
             log_warn "claude exited with code $claude_exit (checking status file...)"
@@ -255,3 +264,4 @@ main() {
 
 # Run main
 main "$@"
+
